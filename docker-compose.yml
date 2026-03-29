@@ -1,0 +1,132 @@
+version: '3.9'
+
+services:
+  # PostgreSQL Database for bot data storage
+  postgres:
+    image: postgres:15-alpine
+    container_name: music_bot_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${DB_USER:-music_bot_user}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-secure_password}
+      POSTGRES_DB: ${DB_NAME:-music_bot_db}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-music_bot_user}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - music_bot_network
+
+  # Redis for caching and rate limiting
+  redis:
+    image: redis:7-alpine
+    container_name: music_bot_redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - music_bot_network
+
+  # Telegram Music Bot Application
+  bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: music_bot_app
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      # Telegram
+      BOT_TOKEN: ${BOT_TOKEN}
+      ADMIN_ID: ${ADMIN_ID}
+      
+      # Database
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_USER: ${DB_USER:-music_bot_user}
+      DB_PASSWORD: ${DB_PASSWORD:-secure_password}
+      DB_NAME: ${DB_NAME:-music_bot_db}
+      DATABASE_URL: postgresql+asyncpg://${DB_USER:-music_bot_user}:${DB_PASSWORD:-secure_password}@postgres:5432/${DB_NAME:-music_bot_db}
+      
+      # Redis
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_DB: 0
+      REDIS_ENABLED: ${REDIS_ENABLED:-true}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      
+      # Application
+      APP_NAME: Finder Music Bot
+      DEBUG: ${DEBUG:-false}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      LOG_FILE: /app/logs/bot.log
+      REQUIRED_CHANNEL_USERNAME: ${REQUIRED_CHANNEL_USERNAME:-@TjMusik}
+      FREE_MUSIC_REQUEST_LIMIT: ${FREE_MUSIC_REQUEST_LIMIT:-3}
+      
+      # Downloads
+      CACHE_DIR: /app/cache
+      DOWNLOADS_DIR: /app/cache/downloads
+      MAX_CONCURRENT_DOWNLOADS: 3
+      DOWNLOAD_TIMEOUT: 300
+      
+      # Cache
+      CACHE_TTL: 600
+      CACHE_FILE_TTL: 604800
+      CACHE_MAX_SIZE_GB: 10
+      
+      # File sizes
+      MAX_FILE_SIZE_MB: 50
+      PREMIUM_FILE_SIZE_MB: 2000
+      
+      # Quality
+      DEFAULT_AUDIO_BITRATE: 192
+      DEFAULT_VIDEO_RESOLUTION: 720
+      SUPPORTED_AUDIO_BITRATES: 96,128,192,320
+      SUPPORTED_VIDEO_RESOLUTIONS: 480,720,1080
+      
+      # Cloud storage (optional)
+      GOOGLE_DRIVE_ENABLED: ${GOOGLE_DRIVE_ENABLED:-false}
+      DROPBOX_ENABLED: ${DROPBOX_ENABLED:-false}
+      
+      # FFmpeg
+      FFMPEG_PATH: /usr/bin/ffmpeg
+      
+      # Rate limiting
+      RATE_LIMIT_REQUESTS: 5
+      RATE_LIMIT_WINDOW: 60
+      
+      # Python
+      PYTHONUNBUFFERED: 1
+      PYTHONDONTWRITEBYTECODE: 1
+    
+    volumes:
+      - ./cache:/app/cache
+      - ./logs:/app/logs
+      - ./secrets:/app/secrets:ro  # For Google Drive credentials
+    
+    networks:
+      - music_bot_network
+
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+
+networks:
+  music_bot_network:
+    driver: bridge
+
