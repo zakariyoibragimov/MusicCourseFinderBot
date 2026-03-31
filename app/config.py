@@ -16,17 +16,28 @@ class Config:
     """
     Application settings from environment variables
     """
+
+    # YouTube/yt-dlp Proxy
+    YTDLP_PROXY_URL: Optional[str] = os.getenv("YTDLP_PROXY_URL", None)
+    YTMUSIC_PROXY_URL: Optional[str] = os.getenv("YTMUSIC_PROXY_URL", None)
+    YTDLP_IMPERSONATE: Optional[str] = os.getenv("YTDLP_IMPERSONATE", "chrome")
+    YTDLP_COOKIES_FILE: Optional[str] = os.getenv("YTDLP_COOKIES_FILE", None)
+    YTDLP_COOKIES_FROM_BROWSER: Optional[str] = os.getenv("YTDLP_COOKIES_FROM_BROWSER", None)
     
     # Telegram Bot
     BOT_TOKEN: str = os.getenv("BOT_TOKEN", "")
-    ADMIN_ID: int = int(os.getenv("ADMIN_ID", "0"))
+    _admin_id_env = os.getenv("ADMIN_ID", None)
+    ADMIN_ID: Optional[int] = int(_admin_id_env) if _admin_id_env and _admin_id_env.isdigit() else None
     TELEGRAM_CONNECT_TIMEOUT: float = float(os.getenv("TELEGRAM_CONNECT_TIMEOUT", "30"))
     TELEGRAM_READ_TIMEOUT: float = float(os.getenv("TELEGRAM_READ_TIMEOUT", "30"))
     TELEGRAM_WRITE_TIMEOUT: float = float(os.getenv("TELEGRAM_WRITE_TIMEOUT", "30"))
     TELEGRAM_POOL_TIMEOUT: float = float(os.getenv("TELEGRAM_POOL_TIMEOUT", "10"))
-    TELEGRAM_MEDIA_WRITE_TIMEOUT: float = float(os.getenv("TELEGRAM_MEDIA_WRITE_TIMEOUT", "60"))
     TELEGRAM_BOOTSTRAP_RETRIES: int = int(os.getenv("TELEGRAM_BOOTSTRAP_RETRIES", "3"))
-    TELEGRAM_USE_ENV_PROXY: bool = os.getenv("TELEGRAM_USE_ENV_PROXY", "false").lower() == "true"
+    USE_PROXY: bool = os.getenv("USE_PROXY", "false").lower() == "true"
+    TELEGRAM_USE_ENV_PROXY: bool = os.getenv(
+        "TELEGRAM_USE_ENV_PROXY",
+        "true" if USE_PROXY else "false",
+    ).lower() == "true"
     TELEGRAM_PROXY_URL: Optional[str] = os.getenv("TELEGRAM_PROXY_URL", None)
     REQUIRED_CHANNEL_USERNAME: str = os.getenv("REQUIRED_CHANNEL_USERNAME", "@TjMusik")
     FREE_MUSIC_REQUEST_LIMIT: int = int(os.getenv("FREE_MUSIC_REQUEST_LIMIT", "3"))
@@ -37,9 +48,10 @@ class Config:
     DB_NAME: str = os.getenv("DB_NAME", "music_bot")
     DB_USER: str = os.getenv("DB_USER", "postgres")
     DB_PASSWORD: str = os.getenv("DB_PASSWORD", "password")
+    DATABASE_DRIVER: str = os.getenv("DATABASE_DRIVER", "psycopg")
     DATABASE_URL: str = os.getenv(
         "DATABASE_URL", 
-        f"postgresql+asyncpg://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
+        f"postgresql+{DATABASE_DRIVER}://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
     )
     
     # Redis
@@ -78,6 +90,7 @@ class Config:
     PREMIUM_FILE_SIZE_MB: int = int(os.getenv("PREMIUM_FILE_SIZE_MB", "2000"))
     DOWNLOAD_TIMEOUT: int = int(os.getenv("DOWNLOAD_TIMEOUT", "300"))
     MAX_CONCURRENT_DOWNLOADS: int = int(os.getenv("MAX_CONCURRENT_DOWNLOADS", "3"))
+    YTDLP_EXTRACTOR_RETRIES: int = int(os.getenv("YTDLP_EXTRACTOR_RETRIES", "2"))
     
     # Cache settings
     CACHE_DIR: str = os.getenv("CACHE_DIR", "./cache")
@@ -112,14 +125,15 @@ class Config:
     DOWNLOADS_DIR: str = "cache/downloads"
     
     @classmethod
-    def validate(cls) -> bool:
+    def validate(cls, require_bot: bool = True) -> bool:
         """Проверяет обязательные параметры конфигурации."""
-        if not cls.BOT_TOKEN:
-            raise ValueError("BOT_TOKEN не установлен")
-        if not cls.ADMIN_ID or cls.ADMIN_ID == 0:
-            raise ValueError("ADMIN_ID не установлен")
-        if not cls.REQUIRED_CHANNEL_USERNAME:
-            raise ValueError("REQUIRED_CHANNEL_USERNAME не установлен")
+        if require_bot:
+            if not cls.BOT_TOKEN:
+                raise ValueError("BOT_TOKEN не установлен")
+            if cls.ADMIN_ID is None:
+                raise ValueError("ADMIN_ID не установлен")
+            if not cls.REQUIRED_CHANNEL_USERNAME:
+                raise ValueError("REQUIRED_CHANNEL_USERNAME не установлен")
         # Create required directories
         Path(cls.CACHE_DIR).mkdir(parents=True, exist_ok=True)
         Path(cls.DOWNLOADS_DIR).mkdir(parents=True, exist_ok=True)

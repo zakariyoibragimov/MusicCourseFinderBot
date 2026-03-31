@@ -9,8 +9,14 @@ from app.services.downloader import MediaDownloader
 from app.utils.media_delivery import send_downloaded_audio
 from app.locales import get_text
 from app.utils.subscription import ensure_music_access
+from app.utils.telegram_helpers import safe_answer_callback
 import uuid
 import hashlib
+
+
+def _get_downloader(context) -> MediaDownloader:
+    """Get the shared downloader service with a safe local fallback."""
+    return context.bot_data.get("downloader") or MediaDownloader()
 
 
 def store_search_results(context, query_text: str, results: list) -> str:
@@ -47,10 +53,7 @@ def get_track_from_results(context, track_id: str):
 
 async def send_search_results(wait_message, context, query_text: str, lang: str) -> bool:
     """Search YouTube and replace a waiting message with formatted results."""
-    downloader = context.bot_data.get("downloader")
-    if not downloader:
-        downloader = MediaDownloader()
-
+    downloader = _get_downloader(context)
     results = await downloader.search(query_text, source="youtube", limit=10)
     if not results:
         await wait_message.edit_text(get_text("not_found", lang))
@@ -86,10 +89,7 @@ async def inline_search_handler(update: Update, context: ContextTypes.DEFAULT_TY
 
         # Get Redis service from context
         redis_service = context.bot_data.get("redis_service") or context.bot_data.get("redis")
-        downloader = context.bot_data.get("downloader")
-        
-        if not downloader:
-            downloader = MediaDownloader()
+        downloader = _get_downloader(context)
         
         # Search cache key
         cache_key = f"inline_search:{query}"
@@ -156,7 +156,7 @@ async def search_pagination_handler(update: Update, context: ContextTypes.DEFAUL
     """Handle pagination buttons: search_next, search_prev"""
     
     query = update.callback_query
-    await query.answer()
+    await safe_answer_callback(query)
     
     try:
         # Parse callback: search_next_hash_page or search_prev_hash_page
@@ -169,7 +169,7 @@ async def search_pagination_handler(update: Update, context: ContextTypes.DEFAUL
         results = context.user_data.get(f'search_results_{query_hash}', [])
         
         if not results:
-            await query.answer("Results expired, please search again", show_alert=True)
+            await safe_answer_callback(query, "Results expired, please search again", show_alert=True)
             return
         
         # Calculate new page
@@ -189,7 +189,7 @@ async def search_pagination_handler(update: Update, context: ContextTypes.DEFAUL
         
     except Exception as e:
         logger.error(f"Pagination error: {str(e)}")
-        await query.answer(f"Error: {str(e)}", show_alert=True)
+        await safe_answer_callback(query, f"Error: {str(e)}", show_alert=True)
 
 
 async def track_action_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -199,7 +199,7 @@ async def track_action_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     lang = context.user_data.get("lang", "ru")
     
     query = update.callback_query
-    await query.answer("🎧")
+    await safe_answer_callback(query, "🎧")
     
     try:
         callback_data = query.data
@@ -209,20 +209,18 @@ async def track_action_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         if action == "listen":
             if not await ensure_music_access(update, context):
                 return
-            url = f"https://youtube.com/watch?v={track_id}"
+            track = get_track_from_results(context, track_id)
+            url = (track or {}).get("url") or f"https://youtube.com/watch?v={track_id}"
             
             status_msg = await query.message.reply_text(get_text("downloading", lang), parse_mode="HTML")
             
-            dl = context.bot_data.get("downloader")
-            if not dl:
-                dl = MediaDownloader()
-            
+            dl = _get_downloader(context)
             bitrate = context.user_data.get("audio_bitrate", "192")
             result = await dl.download_audio(url, bitrate=bitrate)
             sent = await send_downloaded_audio(query.message, result, lang, status_message=status_msg)
             if sent:
                 db = context.bot_data.get("db")
-                track = get_track_from_results(context, track_id) or {
+                track = track or {
                     "id": track_id,
                     "url": url,
                     "title": result.get("title", "Unknown") if result else "Unknown",
@@ -236,16 +234,16 @@ async def track_action_handler(update: Update, context: ContextTypes.DEFAULT_TYP
             db = context.bot_data.get("db")
             track = get_track_from_results(context, track_id)
             if not db or not track:
-                await query.answer("❌ Трек не найден", show_alert=True)
+                await safe_answer_callback(query, "❌ Трек не найден", show_alert=True)
                 return
 
             added = await db.add_to_favorites(update.effective_user.id, track)
-            await query.answer("❤️ Добавлено в избранное" if added else "ℹ️ Уже в избранном", show_alert=False)
+            await safe_answer_callback(query, "❤️ Добавлено в избранное" if added else "ℹ️ Уже в избранном", show_alert=False)
             logger.info(f"Favorite action for user {update.effective_user.id}: {callback_data}")
         
         else:
             logger.warning(f"Unknown action: {action}")
-            await query.answer("Неизвестное действие", show_alert=True)
+            await safe_answer_callback(query, "Неизвестное действие", show_alert=True)
             
     except Exception as e:
         logger.error(f"Track action error: {str(e)}")

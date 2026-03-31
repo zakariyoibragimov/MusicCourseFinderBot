@@ -32,18 +32,16 @@ async def main():
     logger.info("=" * 60)
     
     try:
-        # Load config
-        config = Config()
         logger.info(f"📋 Configuration loaded from environment")
-        logger.info(f"   Database: {config.db_name} @ {config.db_host}:{config.db_port}")
-        logger.info(f"   Redis: {config.redis_host}:{config.redis_port}")
+        logger.info(f"   Database: {Config.DB_NAME} @ {Config.DB_HOST}:{Config.DB_PORT}")
+        logger.info(f"   Redis: {Config.REDIS_HOST}:{Config.REDIS_PORT}")
         
         # Validate config
-        config.validate()
+        Config.validate(require_bot=False)
         logger.info("✅ Configuration validated")
         
         # Initialize database service
-        db_service = DatabaseService(config)
+        db_service = DatabaseService(Config.DATABASE_URL)
         logger.info("🔗 Connecting to database...")
         
         await db_service.initialize()

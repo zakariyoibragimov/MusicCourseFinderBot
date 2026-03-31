@@ -8,7 +8,13 @@ import asyncio
 from typing import Optional, Callable, Dict, List
 from pathlib import Path
 import yt_dlp
+from yt_dlp.networking.impersonate import ImpersonateTarget
 from app.config import Config
+from app.services.music_search import (
+    download_youtube_audio_subprocess,
+    download_youtube_video_subprocess,
+    search_youtube_music_subprocess,
+)
 from app.utils.logger import logger
 from app.utils.helpers import get_file_size_mb
 
@@ -21,6 +27,155 @@ class MediaDownloader:
         Path(Config.DOWNLOADS_DIR).mkdir(parents=True, exist_ok=True)
         self.max_concurrent = Config.MAX_CONCURRENT_DOWNLOADS
         self.semaphore = asyncio.Semaphore(self.max_concurrent)
+
+    @staticmethod
+    def _is_downloadable_youtube_entry(entry: Dict) -> bool:
+        """Keep only actual video entries and skip channels/playlists."""
+        if not entry:
+            return False
+
+        entry_id = str(entry.get("id") or "")
+        ie_key = str(entry.get("ie_key") or "")
+        entry_type = str(entry.get("_type") or "")
+
+        if ie_key and ie_key != "Youtube":
+            return False
+        if entry_type and entry_type != "url":
+            return False
+        if len(entry_id) != 11:
+            return False
+        return True
+
+    @staticmethod
+    def _parse_browser_cookies(value: Optional[str]):
+        """Parse browser cookies setting for yt-dlp Python API."""
+        if not value:
+            return None
+
+        browser_spec = value.strip()
+        if not browser_spec:
+            return None
+
+        browser_part, separator, container = browser_spec.partition("::")
+        browser_profile = browser_part.split(":", 1)
+        browser_name = browser_profile[0].strip().lower()
+        profile = browser_profile[1].strip() if len(browser_profile) > 1 and browser_profile[1].strip() else None
+        container_name = container.strip() if separator and container.strip() else None
+        return (browser_name, profile, None, container_name)
+
+    def _build_base_ydl_opts(self, *, quiet: bool, no_warnings: bool, download: bool) -> dict:
+        """Build common yt-dlp options shared by search and download."""
+        ydl_opts = {
+            'quiet': quiet,
+            'no_warnings': no_warnings,
+            'socket_timeout': Config.DOWNLOAD_TIMEOUT,
+            'proxy': Config.YTDLP_PROXY_URL,
+            'noplaylist': True,
+            'retries': 3,
+            'extractor_retries': Config.YTDLP_EXTRACTOR_RETRIES,
+            'geo_bypass': True,
+            'http_headers': {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36',
+                'Accept-Language': 'en-US,en;q=0.9',
+            },
+            'extractor_args': {
+                'youtube': {
+                    'player_client': ['android', 'web', 'tv_embedded'],
+                }
+            },
+        }
+
+        if Config.YTDLP_IMPERSONATE:
+            try:
+                ydl_opts['impersonate'] = ImpersonateTarget.from_str(Config.YTDLP_IMPERSONATE.lower())
+            except ValueError as error:
+                logger.warning(f"Invalid YTDLP_IMPERSONATE value '{Config.YTDLP_IMPERSONATE}': {error}")
+
+        if Config.YTDLP_COOKIES_FILE and os.path.exists(Config.YTDLP_COOKIES_FILE):
+            ydl_opts['cookiefile'] = Config.YTDLP_COOKIES_FILE
+        else:
+            cookies_from_browser = self._parse_browser_cookies(Config.YTDLP_COOKIES_FROM_BROWSER)
+            if cookies_from_browser:
+                ydl_opts['cookiesfrombrowser'] = cookies_from_browser
+
+        if not download:
+            ydl_opts['skip_download'] = True
+
+        return ydl_opts
+
+    @staticmethod
+    def _is_transport_error(error: Exception) -> bool:
+        message = str(error).lower()
+        markers = [
+            "unable to download api page",
+            "failed to perform, curl",
+            "connection was reset",
+            "sslerror",
+            "recv failure",
+            "timed out",
+        ]
+        return any(marker in message for marker in markers)
+
+    def _build_search_retry_opts(self, ydl_opts: dict) -> list[dict]:
+        """Build conservative retry variants for flaky YouTube search requests."""
+        variants = []
+
+        no_proxy = dict(ydl_opts)
+        no_proxy.pop('proxy', None)
+        variants.append(no_proxy)
+
+        stripped = dict(no_proxy)
+        stripped.pop('impersonate', None)
+        stripped.pop('cookiefile', None)
+        stripped.pop('cookiesfrombrowser', None)
+        stripped['extractor_args'] = {
+            'youtube': {
+                'player_client': ['android'],
+            }
+        }
+        variants.append(stripped)
+
+        plain = dict(stripped)
+        plain.pop('http_headers', None)
+        variants.append(plain)
+
+        unique_variants = []
+        seen = set()
+        for variant in variants:
+            signature = tuple(sorted((key, repr(value)) for key, value in variant.items()))
+            if signature in seen:
+                continue
+            seen.add(signature)
+            unique_variants.append(variant)
+        return unique_variants
+
+    @staticmethod
+    def _is_bot_check_error(error: Exception) -> bool:
+        message = str(error).lower()
+        return "sign in to confirm you're not a bot" in message or "cookies-from-browser" in message
+
+    def _browser_cookie_fallbacks(self) -> list[tuple[str, Optional[str], None, Optional[str]]]:
+        """Return local browser cookie fallbacks for YouTube downloads."""
+        configured = self._parse_browser_cookies(Config.YTDLP_COOKIES_FROM_BROWSER)
+        fallbacks = []
+        if configured:
+            fallbacks.append(configured)
+
+        for browser in ["edge", "chrome", "firefox"]:
+            candidate = (browser, None, None, None)
+            if candidate not in fallbacks:
+                fallbacks.append(candidate)
+
+        return fallbacks
+
+    @staticmethod
+    def _is_youtube_url(url: str) -> bool:
+        value = (url or "").lower()
+        return "youtube.com/" in value or "youtu.be/" in value
+
+    def _prefer_isolated_youtube_download(self, url: str) -> bool:
+        """Use the clean worker immediately on Windows where in-process yt-dlp is unstable."""
+        return os.name == "nt" and self._is_youtube_url(url)
     
     async def search(
         self,
@@ -41,24 +196,54 @@ class MediaDownloader:
         """
         try:
             if source == "youtube":
-                ydl_opts = {
-                    'quiet': True,
-                    'no_warnings': True,
-                    'extract_flat': 'in_playlist',
-                    'skip_download': True,
-                    'socket_timeout': 10,
-                }
-                
-                def _do_search():
-                    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                        return ydl.extract_info(f"ytsearch{limit * 3}:{query}", download=False)
-                
+                try:
+                    music_results = search_youtube_music_subprocess(query, limit, proxy_url=Config.YTMUSIC_PROXY_URL)
+
+                    if music_results:
+                        logger.info(f"YTMusic search: {query} - found {len(music_results)} results")
+                        return music_results
+                except Exception as error:
+                    logger.warning(f"YTMusic fallback search error for '{query}': {error}")
+
                 loop = asyncio.get_event_loop()
-                info = await loop.run_in_executor(None, _do_search)
+                ydl_opts = self._build_base_ydl_opts(quiet=True, no_warnings=True, download=False)
+                ydl_opts.update({
+                    'extract_flat': 'in_playlist',
+                })
+                attempt_timeout = max(6, min(Config.DOWNLOAD_TIMEOUT, 12))
+                search_attempts = [ydl_opts, *self._build_search_retry_opts(ydl_opts)[:1]]
+
+                def _do_search(options):
+                    with yt_dlp.YoutubeDL(options) as ydl:
+                        return ydl.extract_info(f"ytsearch{limit * 3}:{query}", download=False)
+
+                info = None
+                last_error = None
+
+                for attempt, options in enumerate(search_attempts, start=1):
+                    try:
+                        info = await asyncio.wait_for(
+                            loop.run_in_executor(None, lambda opts=options: _do_search(opts)),
+                            timeout=attempt_timeout,
+                        )
+                        if attempt > 1:
+                            logger.info(f"YouTube search recovered on retry #{attempt} for query: {query}")
+                        break
+                    except asyncio.TimeoutError as error:
+                        last_error = error
+                        logger.warning(f"YouTube search retry #{attempt} timed out for '{query}' after {attempt_timeout}s")
+                    except Exception as error:
+                        last_error = error
+                        if not self._is_transport_error(error):
+                            raise
+                        logger.warning(f"YouTube search retry #{attempt} failed for '{query}': {error}")
+
+                if info is None and last_error:
+                    raise last_error
                 
                 results = []
                 for entry in info.get('entries', []):
-                    if entry is None:
+                    if not self._is_downloadable_youtube_entry(entry):
                         continue
                     
                     duration = entry.get('duration') or 0
@@ -81,7 +266,7 @@ class MediaDownloader:
                     
                     if len(results) >= limit:
                         break
-                
+
                 logger.info(f"YouTube search: {query} - found {len(results)} results")
                 return results
             
@@ -93,13 +278,8 @@ class MediaDownloader:
             
             else:
                 # Try generic yt-dlp search
-                ydl_opts = {
-                    'quiet': True,
-                    'no_warnings': True,
-                    'extract_flat': True,
-                    'skip_download': True,
-                    'socket_timeout': 10,
-                }
+                ydl_opts = self._build_base_ydl_opts(quiet=True, no_warnings=True, download=False)
+                ydl_opts['extract_flat'] = True
                 
                 def _generic_search():
                     results = []
@@ -122,10 +302,16 @@ class MediaDownloader:
                     return results
 
                 loop = asyncio.get_event_loop()
-                results = await loop.run_in_executor(None, _generic_search)
+                results = await asyncio.wait_for(
+                    loop.run_in_executor(None, _generic_search),
+                    timeout=max(10, min(Config.DOWNLOAD_TIMEOUT + 5, 25)),
+                )
                 
                 return results
         
+        except asyncio.TimeoutError:
+            logger.error(f"Search timeout for query: {query}")
+            return []
         except Exception as e:
             logger.error(f"Search error: {e}")
             return []
@@ -158,21 +344,30 @@ class MediaDownloader:
     ) -> Optional[Dict]:
         """Internal implementation. Returns dict with path and metadata."""
         try:
+            loop = asyncio.get_event_loop()
+
+            if self._prefer_isolated_youtube_download(url):
+                result = await loop.run_in_executor(
+                    None,
+                    lambda: download_youtube_audio_subprocess(url, Config.DOWNLOADS_DIR, bitrate),
+                )
+                if result:
+                    logger.info(f"Audio download completed via preferred isolated worker: {url}")
+                    return result
+
             output_path = os.path.join(Config.DOWNLOADS_DIR, "%(title)s.%(ext)s")
-            
+
+            base_opts = self._build_base_ydl_opts(quiet=True, no_warnings=True, download=True)
             ydl_opts = {
-                'format': 'bestaudio/best',
-                'postprocessors': [{
-                    'key': 'FFmpegExtractAudio',
-                    'preferredcodec': 'mp3',
-                    'preferredquality': bitrate,
-                }],
+                'format': '18/best[ext=mp4][acodec!=none]/best[acodec!=none]/bestaudio/best',
                 'outtmpl': output_path,
-                'quiet': True,
-                'no_warnings': True,
-                'socket_timeout': Config.DOWNLOAD_TIMEOUT,
-                'http_headers': {'User-Agent': 'Mozilla/5.0'},
                 'writethumbnail': True,
+                'windowsfilenames': True,
+                'extractor_args': {
+                    'youtube': {
+                        'player_client': ['android'],
+                    }
+                },
                 'postprocessors': [
                     {
                         'key': 'FFmpegExtractAudio',
@@ -185,12 +380,55 @@ class MediaDownloader:
                     },
                 ],
             }
+            ydl_opts = {**base_opts, **ydl_opts}
             
             if progress_callback:
                 ydl_opts['progress_hooks'] = [self._create_progress_hook(progress_callback)]
             
-            loop = asyncio.get_event_loop()
-            info = await loop.run_in_executor(None, lambda: self._extract_and_download(url, ydl_opts))
+            info = None
+            last_error = None
+
+            try:
+                info = await loop.run_in_executor(None, lambda: self._extract_and_download(url, ydl_opts))
+            except Exception as error:
+                last_error = error
+                if self._is_bot_check_error(error):
+                    if ydl_opts.get('proxy'):
+                        logger.warning(f"Retrying without proxy for {url}: {error}")
+                        retry_opts = dict(ydl_opts)
+                        retry_opts.pop('proxy', None)
+                        try:
+                            info = await loop.run_in_executor(None, lambda opts=retry_opts: self._extract_and_download(url, opts))
+                            logger.info(f"Audio download succeeded without proxy: {url}")
+                        except Exception as retry_error:
+                            last_error = retry_error
+
+                    if info is None:
+                        logger.warning(f"Retrying with browser cookies for {url}: {last_error}")
+                        for cookies_from_browser in self._browser_cookie_fallbacks():
+                            retry_opts = dict(ydl_opts)
+                            retry_opts.pop('cookiefile', None)
+                            retry_opts['cookiesfrombrowser'] = cookies_from_browser
+                            try:
+                                info = await loop.run_in_executor(None, lambda opts=retry_opts: self._extract_and_download(url, opts))
+                                logger.info(f"Audio download succeeded with browser cookies: {cookies_from_browser[0]}")
+                                break
+                            except Exception as retry_error:
+                                last_error = retry_error
+                                logger.warning(f"Browser cookie retry failed for {cookies_from_browser[0]}: {retry_error}")
+                if info is None and last_error and (
+                    self._is_transport_error(last_error) or self._is_bot_check_error(last_error)
+                ):
+                    logger.warning(f"Falling back to isolated audio download worker for {url}: {last_error}")
+                    fallback_result = await loop.run_in_executor(
+                        None,
+                        lambda: download_youtube_audio_subprocess(url, Config.DOWNLOADS_DIR, bitrate),
+                    )
+                    if fallback_result:
+                        logger.info(f"Audio download succeeded via isolated worker: {url}")
+                        return fallback_result
+                if info is None and last_error:
+                    raise last_error
             
             if not info:
                 return None
@@ -275,9 +513,22 @@ class MediaDownloader:
     ) -> Optional[str]:
         """Internal implementation"""
         try:
+            loop = asyncio.get_event_loop()
+
+            if self._prefer_isolated_youtube_download(url):
+                video_path = await loop.run_in_executor(
+                    None,
+                    lambda: download_youtube_video_subprocess(url, Config.DOWNLOADS_DIR, resolution),
+                )
+                if video_path and os.path.exists(video_path):
+                    size_mb = get_file_size_mb(video_path)
+                    logger.info(f"Downloaded MP4 via preferred isolated worker: {video_path} ({size_mb:.2f} MB)")
+                    return video_path
+
             output_path = os.path.join(Config.DOWNLOADS_DIR, "%(title)s.%(ext)s")
             res_num = resolution.replace('p', '')
-            
+
+            base_opts = self._build_base_ydl_opts(quiet=False, no_warnings=False, download=True)
             ydl_opts = {
                 'format': f'bestvideo[height<={res_num}]+bestaudio/best[height<={res_num}]',
                 'postprocessors': [{
@@ -285,11 +536,9 @@ class MediaDownloader:
                     'preferedformat': 'mp4',
                 }],
                 'outtmpl': output_path,
-                'quiet': False,
-                'no_warnings': False,
-                'socket_timeout': Config.DOWNLOAD_TIMEOUT,
-                'http_headers': {'User-Agent': 'Mozilla/5.0'}
+                'windowsfilenames': True,
             }
+            ydl_opts = {**base_opts, **ydl_opts}
             
             if progress_callback:
                 ydl_opts['progress_hooks'] = [self._create_progress_hook(progress_callback)]
@@ -303,8 +552,17 @@ class MediaDownloader:
                             return test_path
                 return None
 
-            loop = asyncio.get_event_loop()
-            video_path = await loop.run_in_executor(None, _download_video)
+            try:
+                video_path = await loop.run_in_executor(None, _download_video)
+            except Exception as error:
+                if self._is_transport_error(error) or self._is_bot_check_error(error):
+                    logger.warning(f"Falling back to isolated video download worker for {url}: {error}")
+                    video_path = await loop.run_in_executor(
+                        None,
+                        lambda: download_youtube_video_subprocess(url, Config.DOWNLOADS_DIR, resolution),
+                    )
+                else:
+                    raise
             if video_path and os.path.exists(video_path):
                 size_mb = get_file_size_mb(video_path)
                 logger.info(f"Downloaded MP4: {video_path} ({size_mb:.2f} MB)")

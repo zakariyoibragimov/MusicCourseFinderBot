@@ -4,7 +4,11 @@ Initializes all handlers, services, and runs the bot
 """
 
 import asyncio
+import hashlib
+import os
+import re
 from difflib import SequenceMatcher
+from pathlib import Path
 from telegram.error import TimedOut, NetworkError
 from telegram.request import HTTPXRequest
 from telegram.ext import (
@@ -13,33 +17,102 @@ from telegram.ext import (
 )
 
 from app.config import Config
+from app.locales import get_text
+from app.utils.helpers import clean_cache
 from app.utils.logger import setup_logging, logger
-from app.utils.media_delivery import send_downloaded_audio
+from app.utils.telegram_helpers import safe_answer_callback
 from app.services.database import DatabaseService
 from app.services.downloader import MediaDownloader
 from app.services.redis_service import RedisService
 from app.handlers.commands import (
     start_handler, help_handler, search_handler, settings_handler,
     queue_handler, history_handler, favorites_handler, popular_handler,
-    clear_cache_handler, admin_only,
+    clear_cache_handler,
     play_handler, skip_handler, queue_add_handler,
     menu_callback_handler, language_set_handler, settings_callback_handler,
-    subscription_check_handler,
+    subscription_check_handler, reset_user_flow_state,
 )
 from app.handlers.search import inline_search_handler, search_pagination_handler, track_action_handler
 from app.handlers.download import download_audio_handler, download_video_handler, download_quality_handler
+from app.utils.media_delivery import send_downloaded_audio
 from app.utils.subscription import ensure_music_access
+
+try:
+    import msvcrt
+except ImportError:
+    msvcrt = None
+
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
+
+
+if hasattr(asyncio, "WindowsSelectorEventLoopPolicy"):
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 
 # Initialize services
 db_service: DatabaseService = None
 redis_service: RedisService = None
+instance_lock_file = None
+
+
+def acquire_instance_lock() -> bool:
+    """Prevent multiple local bot instances from polling Telegram at the same time."""
+    global instance_lock_file
+
+    if instance_lock_file is not None:
+        return True
+
+    lock_path = Path(Config.CACHE_DIR) / "bot.instance.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+
+    lock_file = open(lock_path, "a+")
+    lock_file.seek(0)
+    lock_file.write("0")
+    lock_file.flush()
+    lock_file.seek(0)
+
+    try:
+        if msvcrt is not None:
+            msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+        elif fcntl is not None:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        lock_file.close()
+        return False
+
+    lock_file.seek(0)
+    lock_file.truncate()
+    lock_file.write(str(os.getpid()))
+    lock_file.flush()
+    instance_lock_file = lock_file
+    return True
+
+
+def release_instance_lock() -> None:
+    """Release the local single-instance lock."""
+    global instance_lock_file
+
+    if instance_lock_file is None:
+        return
+
+    try:
+        instance_lock_file.seek(0)
+        if msvcrt is not None:
+            msvcrt.locking(instance_lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+        elif fcntl is not None:
+            fcntl.flock(instance_lock_file.fileno(), fcntl.LOCK_UN)
+    except OSError:
+        pass
+    finally:
+        instance_lock_file.close()
+        instance_lock_file = None
 
 
 async def _cache_cleanup_loop(application: Application) -> None:
     """Periodically clean old cache files in the background."""
-    from app.utils.helpers import clean_cache
-
     interval_seconds = 6 * 60 * 60
     max_age_days = max(1, Config.CACHE_FILE_TTL // 86400)
 
@@ -147,6 +220,9 @@ def setup_handlers(application: Application) -> None:
     
     # Callback buttons - main menu
     application.add_handler(CallbackQueryHandler(menu_callback_handler, pattern="^(search|popular|help|language|currency|referral|recognize)$"))
+    # Popular pagination
+    from app.handlers.commands import popular_pagination_handler
+    application.add_handler(CallbackQueryHandler(popular_pagination_handler, pattern="^popular_(next|prev)_"))
     
     # Callback buttons - language selection
     application.add_handler(CallbackQueryHandler(language_set_handler, pattern="^set_lang_"))
@@ -173,16 +249,18 @@ def setup_handlers(application: Application) -> None:
 async def handle_text_message(update, context):
     """Handle text messages (URLs, search queries)"""
     try:
-        from app.locales import get_text
         lang = context.user_data.get("lang", "ru")
         text = update.message.text
+
+        if context.user_data.get("awaiting_audio"):
+            await update.message.reply_text(get_text("recognize_prompt", lang), parse_mode="HTML")
+            return
         
         # Check if it's a URL
         if text.startswith(("http://", "https://", "www.")):
             if not await ensure_music_access(update, context):
                 return
-            from app.locales import get_text
-            import hashlib
+            reset_user_flow_state(context)
 
             url_hash = hashlib.md5(text.encode()).hexdigest()[:12]
             context.user_data.setdefault("url_actions", {})[url_hash] = text
@@ -194,7 +272,7 @@ async def handle_text_message(update, context):
         
         # If user is awaiting search — treat as search query
         if context.user_data.get("awaiting_search"):
-            context.user_data["awaiting_search"] = False
+            reset_user_flow_state(context)
             if not await ensure_music_access(update, context):
                 return
             
@@ -223,12 +301,77 @@ async def handle_attachment(update, context):
         logger.error(f"Error handling attachment: {e}")
 
 
+def _normalize_music_text(value: str) -> str:
+    normalized = (value or "").lower().replace("ё", "е")
+    normalized = re.sub(r"[^\w\s]+", " ", normalized, flags=re.UNICODE)
+    normalized = re.sub(r"\s+", " ", normalized, flags=re.UNICODE)
+    return normalized.strip()
+
+
+def _text_similarity(left: str, right: str) -> float:
+    left_norm = _normalize_music_text(left)
+    right_norm = _normalize_music_text(right)
+    if not left_norm or not right_norm:
+        return 0.0
+    if left_norm == right_norm:
+        return 1.0
+    return SequenceMatcher(None, left_norm, right_norm).ratio()
+
+
+def _score_recognition_candidate(recognized: dict, candidate: dict) -> float:
+    title = recognized.get("title", "")
+    artist = recognized.get("artist", "")
+    candidate_title = candidate.get("title", "")
+    candidate_artist = candidate.get("uploader", "")
+    combined_candidate = f"{candidate_title} {candidate_artist}"
+
+    title_score = _text_similarity(title, candidate_title)
+    artist_score = _text_similarity(artist, candidate_artist)
+    combined_score = _text_similarity(f"{artist} {title}", combined_candidate)
+
+    score = (title_score * 0.5) + (artist_score * 0.35) + (combined_score * 0.15)
+
+    markers = ["live", "cover", "remix", "karaoke", "instrumental", "shorts", "sped up", "slowed"]
+    lowered = _normalize_music_text(combined_candidate)
+    if any(marker in lowered for marker in markers):
+        score -= 0.2
+
+    duration = candidate.get("duration")
+    if isinstance(duration, (int, float)):
+        if duration < 45:
+            score -= 0.3
+        elif duration > 480:
+            score -= 0.15
+
+    return score
+
+
+def _get_downloader(context) -> MediaDownloader:
+    """Get the shared downloader service with a safe local fallback."""
+    return context.bot_data.get("downloader") or MediaDownloader()
+
+
+async def _find_best_recognized_track(context, recognized: dict) -> dict | None:
+    query = " ".join(part for part in [recognized.get("artist"), recognized.get("title")] if part)
+    if not query:
+        return None
+
+    downloader = _get_downloader(context)
+    candidates = await downloader.search(query, source="youtube", limit=10)
+    if not candidates:
+        return None
+
+    ranked = sorted(candidates, key=lambda item: _score_recognition_candidate(recognized, item), reverse=True)
+    best_candidate = ranked[0]
+    if _score_recognition_candidate(recognized, best_candidate) < 0.45:
+        return None
+    return best_candidate
+
+
 async def handle_voice_audio(update, context):
     """Handle voice messages and audio files for music recognition"""
     import os
     import tempfile
-    from app.locales import get_text
-    from app.services.downloader import MediaDownloader
 
     async def _safe_tg_call(coro_factory, retries: int = 3):
         """Retry Telegram API calls on transient network errors."""
@@ -243,52 +386,12 @@ async def handle_voice_audio(update, context):
                 await asyncio.sleep(1.2 * (attempt + 1))
         raise last_exc
 
-    def _normalize(text: str) -> str:
-        return " ".join((text or "").lower().replace("-", " ").split())
-
-    def _pick_best_track(candidates: list, expected_artist: str, expected_title: str):
-        """Pick most relevant track by similarity and basic quality heuristics."""
-        if not candidates:
-            return None
-
-        expected = _normalize(f"{expected_artist} {expected_title}")
-        expected_artist_norm = _normalize(expected_artist)
-        bad_markers = [
-            "live", "cover", "karaoke", "nightcore", "sped up", "slowed",
-            "8d", "edit", "lyrics", "lyric", "shorts", "tiktok", "remix"
-        ]
-
-        best_track = None
-        best_score = -999.0
-
-        for tr in candidates:
-            title = _normalize(tr.get("title", ""))
-            uploader = _normalize(tr.get("uploader", ""))
-            duration = tr.get("duration", 0) or 0
-
-            title_score = SequenceMatcher(None, expected, title).ratio()
-            artist_score = SequenceMatcher(None, expected_artist_norm, uploader).ratio()
-            score = (title_score * 0.8) + (artist_score * 0.2)
-
-            if any(marker in title for marker in bad_markers):
-                score -= 0.2
-            if "official" in title or "topic" in uploader:
-                score += 0.07
-            if duration and 90 <= duration <= 360:
-                score += 0.05
-            elif duration and duration < 45:
-                score -= 0.2
-
-            if score > best_score:
-                best_score = score
-                best_track = tr
-
-        return best_track
-
     lang = context.user_data.get("lang", "ru")
 
     if not await ensure_music_access(update, context):
         return
+
+    reset_user_flow_state(context)
 
     wait_msg = None
 
@@ -313,78 +416,45 @@ async def handle_voice_audio(update, context):
         result = await recognize_audio(file_path)
 
         if result:
-            extra_parts = []
-            if result.get("album"):
-                extra_parts.append(f"💿 Альбом: {result['album']}")
-            if result.get("genre"):
-                extra_parts.append(f"🎶 Жанр: {result['genre']}")
-            extra = "\n".join(extra_parts)
-
-            text = get_text(
-                "recognize_result", lang,
-                artist=result["artist"],
-                title=result["title"],
-                extra=extra
-            )
-
-            await _safe_tg_call(lambda: wait_msg.edit_text(text, parse_mode="HTML"))
-
-            # Auto-search and download the recognized track
-            artist = result['artist']
-            title = result['title']
-
-            search_msg = await _safe_tg_call(
-                lambda: update.message.reply_text(
-                    get_text("searching", lang, query=f"{artist} - {title}"), parse_mode="HTML"
+            best_track = await _find_best_recognized_track(context, result)
+            if not best_track:
+                extra_parts = []
+                if result.get("album"):
+                    extra_parts.append(f"💿 Альбом: {result['album']}")
+                if result.get("genre"):
+                    extra_parts.append(f"🎶 Жанр: {result['genre']}")
+                extra = "\n".join(extra_parts)
+                text = get_text(
+                    "recognize_result", lang,
+                    artist=result["artist"],
+                    title=result["title"],
+                    extra=extra
                 )
+                await _safe_tg_call(lambda: wait_msg.edit_text(text, parse_mode="HTML", disable_web_page_preview=True))
+                return
+
+            await _safe_tg_call(lambda: wait_msg.edit_text(get_text("downloading", lang), parse_mode="HTML"))
+
+            downloader = _get_downloader(context)
+            bitrate = context.user_data.get("audio_bitrate", Config.DEFAULT_AUDIO_BITRATE)
+            audio_result = await downloader.download_audio(best_track.get("url") or f"https://youtube.com/watch?v={best_track.get('id')}", bitrate=bitrate)
+            if audio_result:
+                audio_result["title"] = result.get("title") or audio_result.get("title")
+                audio_result["artist"] = result.get("artist") or audio_result.get("artist")
+
+            sent = await send_downloaded_audio(
+                update.message,
+                audio_result,
+                lang,
+                status_message=wait_msg,
+                tg_call=_safe_tg_call,
             )
-
-            dl = context.bot_data.get("downloader")
-            if not dl:
-                dl = MediaDownloader()
-
-            # Try multiple search strategies
-            search_queries = [
-                f"{artist} {title} official audio",
-                f"{artist} {title}",
-                f"{title} {artist}",
-                title,
-            ]
-
-            all_candidates = []
-            for sq in search_queries:
-                search_results = await dl.search(sq, source="youtube", limit=5)
-                all_candidates.extend(search_results)
-
-            uniq = {}
-            for tr in all_candidates:
-                tr_id = tr.get("id")
-                if tr_id and tr_id not in uniq:
-                    uniq[tr_id] = tr
-
-            best_track = _pick_best_track(list(uniq.values()), artist, title)
-
-            if best_track:
-                track = best_track
-                track_url = f"https://youtube.com/watch?v={track.get('id', '')}"
-
-                await _safe_tg_call(lambda: search_msg.edit_text(get_text("downloading", lang), parse_mode="HTML"))
-
-                bitrate = context.user_data.get("audio_bitrate", Config.DEFAULT_AUDIO_BITRATE)
-                dl_result = await dl.download_audio(track_url, bitrate=bitrate)
-                sent = await send_downloaded_audio(
-                    update.message,
-                    dl_result,
-                    lang,
-                    status_message=search_msg,
-                    tg_call=_safe_tg_call,
+            if sent:
+                logger.info(
+                    f"Recognized and sent MP3 for user {update.effective_user.id}: {result['artist']} - {result['title']}"
                 )
-                if sent:
-                    logger.info(
-                        f"Recognized & sent: {dl_result.get('artist', result['artist'])} - {dl_result.get('title', result['title'])}"
-                    )
             else:
-                await _safe_tg_call(lambda: search_msg.edit_text(get_text("not_found", lang)))
+                await _safe_tg_call(lambda: wait_msg.edit_text(get_text("download_fail", lang)))
         else:
             if wait_msg:
                 await _safe_tg_call(lambda: wait_msg.edit_text(get_text("recognize_fail", lang)))
@@ -408,64 +478,83 @@ async def error_handler(update, context):
 async def handle_url_action(update, context):
     """Handle actions for direct URL messages using stored short tokens."""
     query = update.callback_query
-    await query.answer()
+    await safe_answer_callback(query)
 
-    if not await ensure_music_access(update, context):
-        return
-
-    from app.locales import get_text
-    lang = context.user_data.get("lang", "ru")
-    data = query.data
-
-    action = None
-    url_hash = None
-    if data.startswith("play_url_"):
-        action = "play_url"
-        url_hash = data.replace("play_url_", "", 1)
-    elif data.startswith("dl_url_mp3_"):
-        action = "dl_url_mp3"
-        url_hash = data.replace("dl_url_mp3_", "", 1)
-    elif data.startswith("dl_url_mp4_"):
-        action = "dl_url_mp4"
-        url_hash = data.replace("dl_url_mp4_", "", 1)
-    elif data.startswith("add_url_"):
-        action = "add_url"
-        url_hash = data.replace("add_url_", "", 1)
-
-    if not action or not url_hash:
-        await query.message.reply_text(get_text("invalid_callback_data", lang))
-        return
-
-    url = context.user_data.get("url_actions", {}).get(url_hash)
-    if not url:
-        await query.message.reply_text(get_text("url_invalid", lang))
-        return
-
-    dl = context.bot_data.get("downloader") or MediaDownloader()
-    bitrate = context.user_data.get("audio_bitrate", Config.DEFAULT_AUDIO_BITRATE)
-    resolution = context.user_data.get("video_resolution", Config.DEFAULT_VIDEO_RESOLUTION)
-
-    if action in {"play_url", "dl_url_mp3", "dl_url_mp4"}:
-        if action == "dl_url_mp4":
-            status_msg = await query.message.reply_text(get_text("downloading", lang), parse_mode="HTML")
-            result_path = await dl.download_video(url, resolution=resolution)
-            from app.utils.media_delivery import send_downloaded_video
-            await send_downloaded_video(query.message, result_path, lang, status_message=status_msg)
+    try:
+        if not await ensure_music_access(update, context):
             return
 
-        status_msg = await query.message.reply_text(get_text("downloading", lang), parse_mode="HTML")
-        result = await dl.download_audio(url, bitrate=bitrate)
-        from app.utils.media_delivery import send_downloaded_audio
-        await send_downloaded_audio(query.message, result, lang, status_message=status_msg)
-        return
+        reset_user_flow_state(context)
+        lang = context.user_data.get("lang", "ru")
+        data = query.data
 
-    if action == "add_url":
-        queue = context.user_data.setdefault("url_queue", [])
-        queue.append(url)
-        await query.message.reply_text(get_text("url_added_to_queue", lang))
-        return
+        action = None
+        url_hash = None
+        if data.startswith("play_url_"):
+            action = "play_url"
+            url_hash = data.replace("play_url_", "", 1)
+        elif data.startswith("dl_url_mp3_"):
+            action = "dl_url_mp3"
+            url_hash = data.replace("dl_url_mp3_", "", 1)
+        elif data.startswith("dl_url_mp4_"):
+            action = "dl_url_mp4"
+            url_hash = data.replace("dl_url_mp4_", "", 1)
+        elif data.startswith("add_url_"):
+            action = "add_url"
+            url_hash = data.replace("add_url_", "", 1)
 
-    await query.message.reply_text(get_text("invalid_callback_data", lang))
+        if not action or not url_hash:
+            await query.message.reply_text(get_text("invalid_callback_data", lang))
+            return
+
+        url = context.user_data.get("url_actions", {}).get(url_hash)
+        if not url:
+            await query.message.reply_text(get_text("url_invalid", lang))
+            return
+
+        dl = _get_downloader(context)
+        bitrate = context.user_data.get("audio_bitrate", Config.DEFAULT_AUDIO_BITRATE)
+        resolution = context.user_data.get("video_resolution", Config.DEFAULT_VIDEO_RESOLUTION)
+
+        if action in {"play_url", "dl_url_mp3", "dl_url_mp4"}:
+            if action == "dl_url_mp4":
+                status_msg = await query.message.reply_text(get_text("downloading", lang), parse_mode="HTML")
+                result_path = await dl.download_video(url, resolution=resolution)
+                from app.utils.media_delivery import send_downloaded_video
+                await send_downloaded_video(query.message, result_path, lang, status_message=status_msg)
+                return
+
+            status_msg = await query.message.reply_text(get_text("downloading", lang), parse_mode="HTML")
+            result = await dl.download_audio(url, bitrate=bitrate)
+            from app.utils.media_delivery import send_downloaded_audio
+            await send_downloaded_audio(query.message, result, lang, status_message=status_msg)
+            return
+
+        if action == "add_url":
+            db = context.bot_data.get("db")
+            if not db:
+                await query.message.reply_text(get_text("queue_db_unavailable", lang))
+                return
+
+            title = url if len(url) <= 60 else f"{url[:57]}..."
+            await db.add_to_queue(
+                update.effective_user.id,
+                {
+                    "id": url_hash,
+                    "title": title,
+                    "url": url,
+                    "source": "direct_url",
+                    "duration": 0,
+                },
+            )
+            await query.message.reply_text(get_text("url_added_to_queue", lang))
+            return
+
+        await query.message.reply_text(get_text("invalid_callback_data", lang))
+    except Exception as error:
+        logger.error(f"URL action error: {error}")
+        lang = context.user_data.get("lang", "ru")
+        await query.message.reply_text(get_text("download_fail", lang))
 
 
 def get_link_action_menu(url_hash: str):
@@ -497,6 +586,10 @@ def main() -> None:
     except ValueError as e:
         logger.error(f"Configuration error: {e}")
         return
+
+    if not acquire_instance_lock():
+        logger.error("Another bot instance is already running; aborting duplicate start")
+        return
     
     logger.info(f"🎵 Запуск {Config.APP_NAME}...")
 
@@ -511,10 +604,7 @@ def main() -> None:
             "read_timeout": Config.TELEGRAM_READ_TIMEOUT,
             "write_timeout": Config.TELEGRAM_WRITE_TIMEOUT,
             "pool_timeout": Config.TELEGRAM_POOL_TIMEOUT,
-            "media_write_timeout": Config.TELEGRAM_MEDIA_WRITE_TIMEOUT,
-            "http_version": "1.1",
             "proxy": proxy,
-            "httpx_kwargs": {"trust_env": Config.TELEGRAM_USE_ENV_PROXY},
         }
 
         bot_request = HTTPXRequest(connection_pool_size=20, **request_kwargs)
@@ -541,6 +631,8 @@ def main() -> None:
         logger.info("Bot stopped by user")
     except Exception as e:
         logger.error(f"Critical error: {e}", exc_info=True)
+    finally:
+        release_instance_lock()
 
 
 if __name__ == "__main__":

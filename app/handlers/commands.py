@@ -4,15 +4,18 @@ Basic command handlers for the bot
 """
 
 from functools import wraps
+import time
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ContextTypes, ConversationHandler
+from telegram.ext import ContextTypes
 from app.utils.logger import logger
 from app.utils.rate_limiter import rate_limiter
 from app.config import Config
 from app.services.downloader import MediaDownloader
 from app.locales import get_text
+from app.utils.helpers import clean_cache, format_duration, get_cache_size_gb
+from app.utils.media_delivery import send_downloaded_audio
 from app.utils.subscription import ensure_music_access, get_free_usage_count, get_subscription_markup, is_user_subscribed
-import hashlib
+from app.utils.telegram_helpers import safe_answer_callback
 from sqlalchemy import select, func
 
 
@@ -23,14 +26,25 @@ LANGUAGE_CHOICES = [
     ("🇺🇿 O'zbekcha", "uz"),
 ]
 
-POPULAR_LANGUAGE_QUERIES = [
-    ("tajik", ["сурудхои точики 2025", "tajik songs 2025", "tojik music 2025"], 6),
-    ("uzbek", ["uzbek qo'shiqlari 2025", "узбек музыка 2025", "uzbek songs 2025"], 6),
-    ("russian", ["русские хиты 2025", "русская музыка новинки 2025", "russian songs 2025"], 4),
-    ("english", ["english pop hits 2025", "top english songs 2025", "new english songs 2025"], 4),
+POPULAR_FALLBACK_TRACKS = [
+    {"id": "fvugX7BG7zI", "title": "Ohi Dil", "duration": 166, "uploader": "Shabnam Surayo", "url": "https://youtube.com/watch?v=fvugX7BG7zI", "thumbnail": None, "source": "youtube"},
+    {"id": "Jckt0HuD-N4", "title": "Khona taklifut knm", "duration": 187, "uploader": "Ruzibeki Fayzali", "url": "https://youtube.com/watch?v=Jckt0HuD-N4", "thumbnail": None, "source": "youtube"},
+    {"id": "Lir_K8ZW3Fc", "title": "Ты только мой", "duration": 200, "uploader": "TamerlanAlena", "url": "https://youtube.com/watch?v=Lir_K8ZW3Fc", "thumbnail": None, "source": "youtube"},
+    {"id": "YkY4X_OaF6o", "title": "I Got Love", "duration": 277, "uploader": "Miyagi & Эндшпиль", "url": "https://youtube.com/watch?v=YkY4X_OaF6o", "thumbnail": None, "source": "youtube"},
+    {"id": "FyTjHg8BLsA", "title": "Chica Bomb", "duration": 209, "uploader": "Dan Balan", "url": "https://youtube.com/watch?v=FyTjHg8BLsA", "thumbnail": None, "source": "youtube"},
+    {"id": "ZmdX1EKKuTc", "title": "Grustnyj dens", "duration": 218, "uploader": "ARTIK & ASTI, Artem Kacher", "url": "https://youtube.com/watch?v=ZmdX1EKKuTc", "thumbnail": None, "source": "youtube"},
+    {"id": "Kx7B-XvmFtE", "title": "Believer", "duration": 205, "uploader": "Imagine Dragons", "url": "https://youtube.com/watch?v=Kx7B-XvmFtE", "thumbnail": None, "source": "youtube"},
+    {"id": "cCfPDrRQp9k", "title": "Houdini", "duration": 186, "uploader": "Dua Lipa", "url": "https://youtube.com/watch?v=cCfPDrRQp9k", "thumbnail": None, "source": "youtube"},
 ]
 
 POPULAR_TRACK_LIMIT = 20
+POPULAR_CACHE_TTL_SECONDS = 900
+
+
+def reset_user_flow_state(context, *, awaiting_search: bool = False, awaiting_audio: bool = False) -> None:
+    """Reset transient user input states used by menu flows."""
+    context.user_data["awaiting_search"] = awaiting_search
+    context.user_data["awaiting_audio"] = awaiting_audio
 
 
 def _get_lang(context) -> str:
@@ -77,17 +91,6 @@ def _get_language_markup() -> InlineKeyboardMarkup:
     ])
 
 
-def _format_duration(duration) -> str:
-    """Format duration in seconds as MM:SS."""
-    try:
-        total_seconds = int(duration or 0)
-    except (TypeError, ValueError):
-        return "--:--"
-
-    minutes, seconds = divmod(total_seconds, 60)
-    return f"{minutes}:{seconds:02d}"
-
-
 def _trim_title(title: str, limit: int = 42) -> str:
     """Trim long titles for compact chat output."""
     if not title:
@@ -95,17 +98,19 @@ def _trim_title(title: str, limit: int = 42) -> str:
     return title if len(title) <= limit else f"{title[:limit - 1]}..."
 
 
-def _build_track_list_keyboard(results: list, refresh_label: str | None = None, refresh_callback: str = "popular") -> InlineKeyboardMarkup:
-    """Build a simple one-button-per-track keyboard with optional refresh row."""
+def _build_popular_reply(results: list, lang: str, page: int, query_hash: str) -> tuple[str, InlineKeyboardMarkup]:
+    """Format popular tracks text and keyboard in one place with pagination."""
+    per_page = 5
+    start = page * per_page
+    end = start + per_page
+    page_results = results[start:end]
     keyboard = []
-
-    for idx, track in enumerate(results, 1):
+    for idx, track in enumerate(page_results, start + 1):
         title = _trim_title(track.get("title", "Unknown"), limit=35)
         duration = track.get("duration", 0)
         duration_suffix = ""
         if isinstance(duration, (int, float)) and duration > 0:
-            duration_suffix = f" ({_format_duration(duration)})"
-
+            duration_suffix = f" ({format_duration(duration)})"
         track_id = track.get("id", str(idx))
         keyboard.append([
             InlineKeyboardButton(
@@ -113,53 +118,60 @@ def _build_track_list_keyboard(results: list, refresh_label: str | None = None, 
                 callback_data=f"listen_{track_id}",
             ),
         ])
+    nav_buttons = []
+    max_pages = (len(results) + per_page - 1) // per_page
+    if page > 0:
+        nav_buttons.append(InlineKeyboardButton("⬅️ Назад", callback_data=f"popular_prev_{query_hash}_{page}"))
+    if page < max_pages - 1:
+        nav_buttons.append(InlineKeyboardButton("Вперёд ➡️", callback_data=f"popular_next_{query_hash}_{page}"))
+    if nav_buttons:
+        keyboard.append(nav_buttons)
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    text = get_text("popular_title", lang) + f"\nСтраница {page+1} из {max_pages}"
+    return text, reply_markup
 
-    if refresh_label:
-        keyboard.append([InlineKeyboardButton(refresh_label, callback_data=refresh_callback)])
 
-    return InlineKeyboardMarkup(keyboard)
+def _build_rotated_popular_tracks(limit: int) -> list:
+    """Rotate fallback tracks so repeated opens don't always show the same first page."""
+    if not POPULAR_FALLBACK_TRACKS:
+        return []
+
+    rotation = int(time.time()) % len(POPULAR_FALLBACK_TRACKS)
+    rotated = POPULAR_FALLBACK_TRACKS[rotation:] + POPULAR_FALLBACK_TRACKS[:rotation]
+    return rotated[:limit]
 
 
-def _build_popular_reply(results: list, lang: str) -> tuple[str, InlineKeyboardMarkup]:
-    """Format popular tracks text and keyboard in one place."""
-    reply_markup = _build_track_list_keyboard(results[:POPULAR_TRACK_LIMIT], refresh_label=get_text("btn_refresh", lang))
-    return get_text("popular_title", lang), reply_markup
+async def _load_popular_tracks(context, limit: int = POPULAR_TRACK_LIMIT, *, force_refresh: bool = False) -> list:
+    """Load popular tracks, refreshing the ordering when user opens the section again."""
+    cache_entry = context.bot_data.get("popular_tracks_cache")
+    now = time.time()
+    if not force_refresh and cache_entry and cache_entry.get("expires_at", 0) > now:
+        cached_results = cache_entry.get("results") or []
+        if cached_results:
+            return cached_results[:limit]
+
+    trimmed_results = _build_rotated_popular_tracks(limit)
+    context.bot_data["popular_tracks_cache"] = {
+        "results": trimmed_results,
+        "expires_at": now + POPULAR_CACHE_TTL_SECONDS,
+    }
+    return trimmed_results
 
 
-async def _load_popular_tracks(context, limit: int = POPULAR_TRACK_LIMIT) -> list:
-    """Load popular tracks ordered by language groups: Tajik, Uzbek, Russian, English."""
-    downloader = context.bot_data.get("downloader")
-    if not downloader:
-        downloader = MediaDownloader()
+async def _send_popular_reply(message, context, lang: str, *, force_refresh: bool) -> bool:
+    """Render the popular section into a chat message with fresh stored pagination state."""
+    results = await _load_popular_tracks(context, limit=POPULAR_TRACK_LIMIT, force_refresh=force_refresh)
+    if not results:
+        await message.reply_text(get_text("popular_error", lang))
+        return False
 
-    results = []
-    seen_ids = set()
+    from app.handlers.search import store_search_results
 
-    for _, queries, target_count in POPULAR_LANGUAGE_QUERIES:
-        added_for_group = 0
-
-        for query in queries:
-            search_results = await downloader.search(query, source="youtube", limit=max(target_count * 2, target_count))
-
-            for track in search_results:
-                track_id = track.get("id")
-                if not track_id or track_id in seen_ids:
-                    continue
-
-                seen_ids.add(track_id)
-                results.append(track)
-                added_for_group += 1
-
-                if len(results) >= limit or added_for_group >= target_count:
-                    break
-
-            if len(results) >= limit or added_for_group >= target_count:
-                break
-
-        if len(results) >= limit:
-            break
-
-    return results[:limit]
+    query_hash = store_search_results(context, f"popular_music:{time.time_ns()}", results)
+    context.user_data["popular_page"] = 0
+    text, reply_markup = _build_popular_reply(results, lang, 0, query_hash)
+    await message.reply_text(text, reply_markup=reply_markup, parse_mode="HTML")
+    return True
 
 
 def admin_only(func):
@@ -175,6 +187,7 @@ def admin_only(func):
 
 async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /start command"""
+    reset_user_flow_state(context)
     
     if not rate_limiter.is_allowed(update.effective_user.id):
         await update.message.reply_text("⏳ Вы отправляете слишком много запросов. Попробуйте позже")
@@ -219,6 +232,7 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 async def help_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /help command"""
+    reset_user_flow_state(context)
     
     lang = _get_lang(context)
     await update.message.reply_text(
@@ -234,8 +248,10 @@ async def search_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     if not context.args:
-        await update.message.reply_text("🔍 <b>Использование:</b> /search &lt;запрос&gt;", parse_mode="HTML")
+        reset_user_flow_state(context, awaiting_search=True)
+        await update.message.reply_text(get_text("search_prompt", _get_lang(context)), parse_mode="HTML")
         return
+    reset_user_flow_state(context)
     
     query = " ".join(context.args)
     
@@ -259,6 +275,7 @@ async def search_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 async def settings_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /settings command"""
+    reset_user_flow_state(context)
     lang = _get_lang(context)
     
     keyboard = [
@@ -314,7 +331,7 @@ async def _save_user_preferences(context, user, **fields) -> None:
 async def settings_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle settings-related callbacks."""
     query = update.callback_query
-    await query.answer()
+    await safe_answer_callback(query)
     lang = _get_lang(context)
     data = query.data
 
@@ -365,6 +382,7 @@ async def settings_callback_handler(update: Update, context: ContextTypes.DEFAUL
 
 async def queue_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /queue command"""
+    reset_user_flow_state(context)
     db = context.bot_data.get("db")
     if not db:
         await update.message.reply_text("❌ База данных недоступна. Очередь временно отключена.")
@@ -383,7 +401,7 @@ async def queue_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         lines = ["🎵 <b>Ваша очередь</b>", ""]
         for item in queue_items:
             lines.append(f"<b>{item.position}. {_trim_title(item.title)}</b>")
-            lines.append(f"• ⏱️ {_format_duration(item.duration)}")
+            lines.append(f"• ⏱️ {format_duration(item.duration)}")
             if item.source:
                 lines.append(f"• Источник: {item.source}")
             lines.append("")
@@ -416,7 +434,7 @@ async def history_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             action = item.action or "listened"
             lines.append(f"<b>{index}. {_trim_title(item.title)}</b>")
             lines.append(f"• Действие: {action}")
-            lines.append(f"• ⏱️ {_format_duration(item.duration)}")
+            lines.append(f"• ⏱️ {format_duration(item.duration)}")
             lines.append(f"• {item.accessed_at.strftime('%d.%m %H:%M')}")
             lines.append("")
 
@@ -446,7 +464,7 @@ async def favorites_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         lines = ["❤️ <b>Избранное</b>", ""]
         for index, item in enumerate(favorite_items, 1):
             lines.append(f"<b>{index}. {_trim_title(item.title)}</b>")
-            lines.append(f"• ⏱️ {_format_duration(item.duration)}")
+            lines.append(f"• ⏱️ {format_duration(item.duration)}")
             if item.source:
                 lines.append(f"• Источник: {item.source}")
             lines.append("")
@@ -458,39 +476,53 @@ async def favorites_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
 
 async def popular_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /popular command - shows real popular tracks"""
+    """Handle /popular command - shows real popular tracks with pagination"""
+    reset_user_flow_state(context)
     if not await ensure_music_access(update, context):
         return
-    
     wait_msg = await update.message.reply_text("🔥 <b>Загружаю популярные треки...</b>", parse_mode="HTML")
-    
     try:
-        results = await _load_popular_tracks(context, limit=POPULAR_TRACK_LIMIT)
-        
-        if not results:
-            await wait_msg.edit_text("❌ Не удалось загрузить популярные треки")
-            return
-        
-        from app.handlers.search import store_search_results
-
-        query_hash = store_search_results(context, "popular_music", results)
-        
-        text, reply_markup = _build_popular_reply(results, _get_lang(context))
-        
-        await wait_msg.edit_text(text, reply_markup=reply_markup, parse_mode="HTML")
-        logger.info(f"Popular tracks loaded in language order for {update.effective_user.id}")
-        
+        await wait_msg.delete()
+        sent = await _send_popular_reply(update.message, context, _get_lang(context), force_refresh=True)
+        if sent:
+            logger.info(f"Popular tracks loaded for {update.effective_user.id}")
     except Exception as e:
         logger.error(f"Popular handler error: {e}")
         await wait_msg.edit_text(f"❌ Ошибка: {str(e)}")
 
 
+async def popular_pagination_handler(update, context):
+    """Handle pagination for popular tracks."""
+    query = update.callback_query
+    await safe_answer_callback(query)
+    try:
+        parts = query.data.split("_")
+        action = parts[1]  # next or prev
+        query_hash = parts[2]
+        current_page = int(parts[3])
+        results = context.user_data.get(f'search_results_{query_hash}', [])
+        if not results:
+            await safe_answer_callback(query, "Результаты устарели, откройте популярное заново", show_alert=True)
+            return
+        max_pages = (len(results) + 4) // 5
+        if action == "next":
+            new_page = min(current_page + 1, max_pages - 1)
+        else:
+            new_page = max(current_page - 1, 0)
+        lang = _get_lang(context)
+        text, reply_markup = _build_popular_reply(results, lang, new_page, query_hash)
+        await query.edit_message_text(text, reply_markup=reply_markup, parse_mode="HTML")
+        context.user_data["popular_page"] = new_page
+        logger.info(f"Popular pagination: page {new_page}")
+    except Exception as e:
+        logger.error(f"Popular pagination error: {str(e)}")
+        await safe_answer_callback(query, f"Ошибка: {str(e)}", show_alert=True)
+
+
 @admin_only
 async def clear_cache_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /clear_cache command (admin only)"""
-    
-    from app.utils.helpers import clean_cache, get_cache_size_gb
-    
+
     text = "🧹 Очищаю кэш..."
     msg = await update.message.reply_text(text)
     
@@ -519,16 +551,76 @@ async def clear_cache_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def play_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /play command"""
-    
-    text = "🎧 Воспроизведение начнется с первого трека в очереди"
-    await update.message.reply_text(text)
+    lang = _get_lang(context)
+    if not await ensure_music_access(update, context):
+        return
+
+    db = context.bot_data.get("db")
+    if not db:
+        await update.message.reply_text(get_text("queue_db_unavailable", lang))
+        return
+
+    queue_items = await db.get_user_queue(update.effective_user.id, limit=1)
+    if not queue_items:
+        await update.message.reply_text(get_text("queue_empty", lang))
+        return
+
+    queue_item = queue_items[0]
+    track_url = queue_item.url or str(queue_item.track_id or "")
+    if not track_url.startswith(("http://", "https://")):
+        track_url = f"https://youtube.com/watch?v={queue_item.track_id}"
+
+    status_msg = await update.message.reply_text(
+        get_text("queue_playing", lang, title=_trim_title(queue_item.title, 60)),
+        parse_mode="HTML",
+    )
+
+    dl = context.bot_data.get("downloader") or MediaDownloader()
+    bitrate = context.user_data.get("audio_bitrate", Config.DEFAULT_AUDIO_BITRATE)
+    result = await dl.download_audio(track_url, bitrate=bitrate)
+    sent = await send_downloaded_audio(update.message, result, lang, status_message=status_msg)
+    if not sent:
+        return
+
+    await db.remove_queue_item(update.effective_user.id, queue_item.id)
+    await db.add_history_entry(
+        update.effective_user.id,
+        {
+            "id": queue_item.track_id,
+            "title": queue_item.title,
+            "source": queue_item.source,
+            "url": track_url,
+            "duration": queue_item.duration,
+        },
+        action="listened",
+    )
 
 
 async def skip_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /skip command"""
-    
-    text = "⏭️ Переключение на следующий трек..."
-    await update.message.reply_text(text)
+    lang = _get_lang(context)
+    db = context.bot_data.get("db")
+    if not db:
+        await update.message.reply_text(get_text("queue_db_unavailable", lang))
+        return
+
+    queue_items = await db.get_user_queue(update.effective_user.id, limit=2)
+    if not queue_items:
+        await update.message.reply_text(get_text("queue_empty", lang))
+        return
+
+    skipped_item = queue_items[0]
+    await db.remove_queue_item(update.effective_user.id, skipped_item.id)
+
+    text = get_text("queue_skipped", lang, title=_trim_title(skipped_item.title, 60))
+    if len(queue_items) > 1:
+        text += "\n\n" + get_text(
+            "queue_next_up",
+            lang,
+            title=_trim_title(queue_items[1].title, 60),
+        )
+
+    await update.message.reply_text(text, parse_mode="HTML")
 
 
 async def queue_add_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -573,43 +665,36 @@ async def menu_callback_handler(update: Update, context: ContextTypes.DEFAULT_TY
     """Handle main menu button callbacks from /start"""
     
     query = update.callback_query
-    await query.answer()
+    await safe_answer_callback(query)
     
     action = query.data
     user = update.effective_user
     lang = _get_lang(context)
     
     if action == "search":
-        context.user_data["awaiting_search"] = True
+        reset_user_flow_state(context, awaiting_search=True)
         await query.message.reply_text(
             get_text("search_prompt", lang),
             parse_mode="HTML"
         )
     
     elif action == "popular":
+        reset_user_flow_state(context)
         if not await ensure_music_access(update, context):
             return
         await query.message.reply_text(get_text("loading_popular", lang), parse_mode="HTML")
         
         try:
-            results = await _load_popular_tracks(context, limit=POPULAR_TRACK_LIMIT)
-            
-            if not results:
-                await query.message.reply_text(get_text("popular_error", lang))
-            else:
-                from app.handlers.search import store_search_results
-
-                query_hash = store_search_results(context, "popular_music", results)
-                
-                text, reply_markup = _build_popular_reply(results, lang)
-                await query.message.reply_text(text, reply_markup=reply_markup, parse_mode="HTML")
-                logger.info(f"Popular menu loaded in language order for {user.id}")
+            sent = await _send_popular_reply(query.message, context, lang, force_refresh=True)
+            if sent:
+                logger.info(f"Popular menu loaded for {user.id}")
                 
         except Exception as e:
             logger.error(f"Popular menu error: {e}")
             await query.message.reply_text(f"❌ Ошибка: {str(e)}")
     
     elif action == "currency":
+        reset_user_flow_state(context)
         await query.message.reply_text(get_text("currency_loading", lang), parse_mode="HTML")
         try:
             from app.services.currency import get_exchange_rates, format_currency_message, LANG_CURRENCIES
@@ -625,11 +710,13 @@ async def menu_callback_handler(update: Update, context: ContextTypes.DEFAULT_TY
             await query.message.reply_text(get_text("currency_error", lang))
     
     elif action == "language":
+        reset_user_flow_state(context)
         await query.message.reply_text(
             get_text("choose_language", lang), reply_markup=_get_language_markup(), parse_mode="HTML"
         )
     
     elif action == "help":
+        reset_user_flow_state(context)
         await query.message.reply_text(
             get_text("help_text", lang),
             parse_mode="HTML",
@@ -639,12 +726,13 @@ async def menu_callback_handler(update: Update, context: ContextTypes.DEFAULT_TY
     elif action == "recognize":
         if not await ensure_music_access(update, context):
             return
-        context.user_data["awaiting_audio"] = True
+        reset_user_flow_state(context, awaiting_audio=True)
         await query.message.reply_text(
             get_text("recognize_prompt", lang), parse_mode="HTML"
         )
     
     elif action == "referral":
+        reset_user_flow_state(context)
         await _show_referral_stats(query.message, user.id, lang, context)
     
     logger.info(f"Menu action '{action}' by {user.username} ({user.id})")
@@ -653,9 +741,10 @@ async def menu_callback_handler(update: Update, context: ContextTypes.DEFAULT_TY
 async def language_set_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle language selection buttons."""
     query = update.callback_query
-    await query.answer()
+    await safe_answer_callback(query)
     
     chosen = query.data.replace("set_lang_", "")
+    reset_user_flow_state(context)
     context.user_data["lang"] = chosen
     await _save_user_preferences(context, update.effective_user, language=chosen)
     lang = chosen
@@ -671,7 +760,7 @@ async def language_set_handler(update: Update, context: ContextTypes.DEFAULT_TYP
 async def subscription_check_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Re-check channel subscription status when user presses the button."""
     query = update.callback_query
-    await query.answer()
+    await safe_answer_callback(query)
 
     lang = _get_lang(context)
     subscribed = await is_user_subscribed(context, update.effective_user.id)

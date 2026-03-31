@@ -1,8 +1,6 @@
-"""
-Database service using SQLAlchemy with asyncpg
-"""
+"""Database service using SQLAlchemy async engines."""
 
-import asyncpg
+from importlib.util import find_spec
 from sqlalchemy.ext.asyncio import (
     AsyncSession, create_async_engine, async_sessionmaker
 )
@@ -103,10 +101,18 @@ class FileCache(Base):
 
 class DatabaseService:
     """Database service for async operations"""
+
+    @staticmethod
+    def _normalize_database_url(database_url: str) -> str:
+        """Fall back to a supported PostgreSQL driver when asyncpg is unavailable."""
+        if database_url.startswith("postgresql+asyncpg://") and find_spec("asyncpg") is None:
+            logger.warning("asyncpg is unavailable; using psycopg driver instead")
+            return database_url.replace("postgresql+asyncpg://", "postgresql+psycopg://", 1)
+        return database_url
     
     def __init__(self, database_url: str):
         """Initialize database service"""
-        self.database_url = database_url
+        self.database_url = self._normalize_database_url(database_url)
         self.engine = None
         self.session_factory = None
     
@@ -262,6 +268,34 @@ class DatabaseService:
                 .limit(limit)
             )
             return list(result.scalars().all())
+
+    async def remove_queue_item(self, user_id: int, queue_item_id: int) -> bool:
+        """Remove a queue item and compact remaining positions."""
+        session = await self.get_session()
+        async with session:
+            result = await session.execute(
+                select(Queue).where(
+                    Queue.user_id == user_id,
+                    Queue.id == queue_item_id,
+                )
+            )
+            queue_item = result.scalar_one_or_none()
+            if not queue_item:
+                return False
+
+            removed_position = queue_item.position or 1
+            await session.delete(queue_item)
+
+            remaining = await session.execute(
+                select(Queue)
+                .where(Queue.user_id == user_id, Queue.position > removed_position)
+                .order_by(Queue.position.asc())
+            )
+            for item in remaining.scalars().all():
+                item.position = max(1, (item.position or 1) - 1)
+
+            await session.commit()
+            return True
 
     async def add_to_favorites(self, user_id: int, track: dict) -> bool:
         """Add track to favorites. Returns False when it already exists."""

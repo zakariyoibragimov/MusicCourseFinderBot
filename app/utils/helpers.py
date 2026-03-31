@@ -11,13 +11,18 @@ from app.utils.logger import logger
 
 
 def format_duration(seconds: int) -> str:
-    """Format seconds to HH:MM:SS"""
-    if not seconds:
+    """Format seconds to HH:MM:SS."""
+    try:
+        total_seconds = max(0, int(seconds or 0))
+    except (TypeError, ValueError):
+        return "--:--"
+
+    if total_seconds == 0:
         return "00:00"
-    
-    hours = seconds // 3600
-    minutes = (seconds % 3600) // 60
-    secs = seconds % 60
+
+    hours = total_seconds // 3600
+    minutes = (total_seconds % 3600) // 60
+    secs = total_seconds % 60
     
     if hours:
         return f"{hours}:{minutes:02d}:{secs:02d}"

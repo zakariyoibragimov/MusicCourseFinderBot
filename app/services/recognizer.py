@@ -7,21 +7,24 @@ import os
 import subprocess
 import tempfile
 import asyncio
+from io import BytesIO
 from app.utils.logger import logger
 
 
 def _recognize_sync(file_path: str) -> dict | None:
     """Synchronous recognition using ShazamAPI."""
     from ShazamAPI import Shazam
+    from pydub import AudioSegment
     
     # Convert OGA to WAV via ffmpeg first — ShazamAPI reads via BytesIO/pydub pipe,
     # which fails on OGA format. WAV works reliably through pipe.
-    tmp_wav = os.path.join(tempfile.gettempdir(), "shazam_input.wav")
+    fd, tmp_wav = tempfile.mkstemp(prefix="shazam_input_", suffix=".wav")
+    os.close(fd)
     try:
         result = subprocess.run(
             [
                 "ffmpeg", "-y", "-i", file_path,
-                "-ar", "44100", "-ac", "1",
+                "-ar", "16000", "-ac", "1", "-sample_fmt", "s16",
                 tmp_wav
             ],
             capture_output=True, timeout=15
@@ -37,6 +40,12 @@ def _recognize_sync(file_path: str) -> dict | None:
         
         with open(tmp_wav, "rb") as f:
             wav_data = f.read()
+
+        def _normalized_from_wav(self, song_data: bytes):
+            """Skip pydub resampling because ffmpeg already prepared 16 kHz mono PCM WAV."""
+            return AudioSegment.from_file(BytesIO(song_data), format="wav")
+
+        Shazam.normalizateAudioData = _normalized_from_wav
         
         shazam = Shazam(wav_data)
         recognize_gen = shazam.recognizeSong()
